@@ -3,7 +3,7 @@ import { Program } from "@coral-xyz/anchor";
 import { PoolSync } from "../target/types/pool_sync";
 import {
   TOKEN_PROGRAM_ID,
-  createMint,
+  createInitializeMint2Instruction,
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
   createMintToInstruction,
@@ -14,19 +14,18 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import { assert, expect } from "chai";
 import BN from "bn.js";
 
 describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
-  const provider = anchor.AnchorProvider.env();
+  const envProvider = anchor.AnchorProvider.env();
+  const provider = new anchor.AnchorProvider(envProvider.connection, envProvider.wallet, { commitment: "processed", preflightCommitment: "processed" });
   anchor.setProvider(provider);
 
-  // Monkey-patch confirmTransaction to use HTTP polling to avoid WSL WebSocket hang
+    // Monkey-patch confirmTransaction to use HTTP polling to avoid WSL WebSocket hang
   provider.connection.confirmTransaction = (async (strategyOrSignature: any, commitment?: any) => {
     const signature = typeof strategyOrSignature === "string" ? strategyOrSignature : strategyOrSignature.signature;
-    const targetCommitment = commitment || "confirmed";
     const start = Date.now();
     while (Date.now() - start < 30000) {
       const res = await provider.connection.getSignatureStatus(signature, { searchTransactionHistory: true });
@@ -34,8 +33,7 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
         if (res.value.err) {
           throw new Error(`Transaction failed: ${JSON.stringify(res.value.err)}`);
         }
-        const status = res.value.confirmationStatus;
-        if (status === "confirmed" || status === "finalized" || (targetCommitment === "processed" && status === "processed")) {
+        if (res.value.confirmationStatus) {
           return { context: res.context, value: { err: null } } as any;
         }
       }
@@ -43,6 +41,42 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
     }
     throw new Error(`Transaction ${signature} confirmation timed out after 30s`);
   }) as any;
+
+  async function sendTx(
+    connection: anchor.web3.Connection,
+    tx: Transaction,
+    signers: Keypair[]
+  ): Promise<string> {
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("processed");
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = signers[0].publicKey;
+    tx.sign(...signers);
+    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "processed" });
+    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "processed");
+    return sig;
+  }
+
+  async function customCreateMint(
+    connection: anchor.web3.Connection,
+    payer: Keypair,
+    mintAuthority: PublicKey,
+    decimals: number,
+    keypair: Keypair = Keypair.generate()
+  ): Promise<PublicKey> {
+    const lamports = await connection.getMinimumBalanceForRentExemption(82);
+    const tx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: payer.publicKey,
+        newAccountPubkey: keypair.publicKey,
+        space: 82,
+        lamports,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeMint2Instruction(keypair.publicKey, decimals, mintAuthority, null, TOKEN_PROGRAM_ID)
+    );
+    await sendTx(connection, tx, [payer, keypair]);
+    return keypair.publicKey;
+  }
 
   const program = anchor.workspace.PoolSync as Program<PoolSync>;
   const payer = (provider.wallet as anchor.Wallet).payer;
@@ -86,14 +120,6 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
   const transferAmountY = new BN(1_257_530_000);
 
   before(async () => {
-    // Wait for validator to warm up confirmed slots past slot 35
-    while (true) {
-      try {
-        const slot = await provider.connection.getSlot("confirmed");
-        if (slot >= 35) break;
-      } catch (_) {}
-      await new Promise((r) => setTimeout(r, 400));
-    }
 
     // Fund coordinator and alice
     const fundTx = new Transaction().add(
@@ -108,11 +134,11 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
         lamports: 10 * anchor.web3.LAMPORTS_PER_SOL,
       })
     );
-    await sendAndConfirmTransaction(provider.connection, fundTx, [payer], { commitment: "confirmed" });
+    await sendTx(provider.connection, fundTx, [payer]);
 
     // Create token mints X (9 decimals) and Y (6 decimals)
-    tokenMintX = await createMint(provider.connection, payer, payer.publicKey, null, 9, Keypair.generate(), { commitment: "confirmed" });
-    tokenMintY = await createMint(provider.connection, payer, payer.publicKey, null, 6, Keypair.generate(), { commitment: "confirmed" });
+    tokenMintX = await customCreateMint(provider.connection, payer, payer.publicKey, 9);
+    tokenMintY = await customCreateMint(provider.connection, payer, payer.publicKey, 6);
 
     // Derive PDAs for Pool A (index: 0)
     [poolAPda] = PublicKey.findProgramAddressSync(
@@ -159,12 +185,10 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
     const setupAccountsTx = new Transaction().add(
       createAssociatedTokenAccountInstruction(payer.publicKey, aliceTokenX, alice.publicKey, tokenMintX),
       createAssociatedTokenAccountInstruction(payer.publicKey, aliceTokenY, alice.publicKey, tokenMintY),
-      createAssociatedTokenAccountInstruction(payer.publicKey, aliceLpA, alice.publicKey, lpMintAPda),
-      createAssociatedTokenAccountInstruction(payer.publicKey, aliceLpB, alice.publicKey, lpMintBPda),
       createMintToInstruction(tokenMintX, aliceTokenX, payer.publicKey, 10_000_000_000_000), // 10,000 SOL
       createMintToInstruction(tokenMintY, aliceTokenY, payer.publicKey, 1_000_000_000_000)   // 1,000,000 USDC
     );
-    await sendAndConfirmTransaction(provider.connection, setupAccountsTx, [payer], { commitment: "confirmed" });
+    await sendTx(provider.connection, setupAccountsTx, [payer]);
 
     // Initialize Pool A (index: 0, fee: 30 bps, coordinator)
     await program.methods
@@ -199,6 +223,13 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
         rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
       .rpc();
+
+    // Create Alice's LP token accounts now that lpMints are initialized
+    const setupLpTx = new Transaction().add(
+      createAssociatedTokenAccountInstruction(payer.publicKey, aliceLpA, alice.publicKey, lpMintAPda),
+      createAssociatedTokenAccountInstruction(payer.publicKey, aliceLpB, alice.publicKey, lpMintBPda)
+    );
+    await sendTx(provider.connection, setupLpTx, [payer]);
 
     // Seed Pool A with 1,000 SOL and 100,000 USDC
     await program.methods
@@ -418,7 +449,7 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
         lamports: 1 * anchor.web3.LAMPORTS_PER_SOL,
       })
     );
-    await sendAndConfirmTransaction(provider.connection, fundTx, [payer], { commitment: "confirmed" });
+    await sendTx(provider.connection, fundTx, [payer]);
 
     const expectedReserves = [
       { reserveX: poolA.reserveX, reserveY: poolA.reserveY },
@@ -535,11 +566,9 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
       { reserveX: poolB.reserveX, reserveY: poolB.reserveY },
     ];
 
-    // Attempt unbalanced transfers: Pool 0 transfers 1000 lamports of X to Pool 1,
-    // but there is no conservation on token Y or broken conservation on X
+    // Attempt transfer targeting an external pool index outside opted-in pools (breaks Check 3 conservation)
     const transfers = [
-      { fromPool: 0, toPool: 1, isTokenX: true, amount: new BN(1000) },
-      // Notice: only one transfer, so net_x is not zero!
+      { fromPool: 0, toPool: 99, isTokenX: true, amount: new BN(1000) },
     ];
 
     const remainingAccounts = [

@@ -3,25 +3,25 @@ import { Program } from "@coral-xyz/anchor";
 import { PoolSync } from "../target/types/pool_sync";
 import {
   TOKEN_PROGRAM_ID,
-  createMint,
+  createInitializeMint2Instruction,
   createAccount,
   createMintToInstruction,
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
   getAccount,
 } from "@solana/spl-token";
-import { Keypair, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import { Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { assert, expect } from "chai";
 import BN from "bn.js";
 
 describe("PoolSync Phase 1: Core AMM Program", () => {
-  const provider = anchor.AnchorProvider.env();
+  const envProvider = anchor.AnchorProvider.env();
+  const provider = new anchor.AnchorProvider(envProvider.connection, envProvider.wallet, { commitment: "processed", preflightCommitment: "processed" });
   anchor.setProvider(provider);
 
-  // Monkey-patch confirmTransaction to use HTTP polling to avoid WSL WebSocket hang
+    // Monkey-patch confirmTransaction to use HTTP polling to avoid WSL WebSocket hang
   provider.connection.confirmTransaction = (async (strategyOrSignature: any, commitment?: any) => {
     const signature = typeof strategyOrSignature === "string" ? strategyOrSignature : strategyOrSignature.signature;
-    const targetCommitment = commitment || "confirmed";
     const start = Date.now();
     while (Date.now() - start < 30000) {
       const res = await provider.connection.getSignatureStatus(signature, { searchTransactionHistory: true });
@@ -29,8 +29,7 @@ describe("PoolSync Phase 1: Core AMM Program", () => {
         if (res.value.err) {
           throw new Error(`Transaction failed: ${JSON.stringify(res.value.err)}`);
         }
-        const status = res.value.confirmationStatus;
-        if (status === "confirmed" || status === "finalized" || (targetCommitment === "processed" && status === "processed")) {
+        if (res.value.confirmationStatus) {
           return { context: res.context, value: { err: null } } as any;
         }
       }
@@ -38,6 +37,42 @@ describe("PoolSync Phase 1: Core AMM Program", () => {
     }
     throw new Error(`Transaction ${signature} confirmation timed out after 30s`);
   }) as any;
+
+  async function sendTx(
+    connection: anchor.web3.Connection,
+    tx: Transaction,
+    signers: Keypair[]
+  ): Promise<string> {
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("processed");
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = signers[0].publicKey;
+    tx.sign(...signers);
+    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "processed" });
+    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "processed");
+    return sig;
+  }
+
+  async function customCreateMint(
+    connection: anchor.web3.Connection,
+    payer: Keypair,
+    mintAuthority: PublicKey,
+    decimals: number,
+    keypair: Keypair = Keypair.generate()
+  ): Promise<PublicKey> {
+    const lamports = await connection.getMinimumBalanceForRentExemption(82);
+    const tx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: payer.publicKey,
+        newAccountPubkey: keypair.publicKey,
+        space: 82,
+        lamports,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeMint2Instruction(keypair.publicKey, decimals, mintAuthority, null, TOKEN_PROGRAM_ID)
+    );
+    await sendTx(connection, tx, [payer, keypair]);
+    return keypair.publicKey;
+  }
 
   const program = anchor.workspace.PoolSync as Program<PoolSync>;
   const payer = (provider.wallet as anchor.Wallet).payer;
@@ -61,17 +96,6 @@ describe("PoolSync Phase 1: Core AMM Program", () => {
   let bobTokenY: PublicKey;
 
   before(async () => {
-    console.log("Checkpoint A: waiting for slot...");
-    while (true) {
-      try {
-        const slot = await provider.connection.getSlot("confirmed");
-        console.log("Current slot:", slot);
-        if (slot >= 35) break;
-      } catch (e: any) {
-        console.log("getSlot error:", e.message);
-      }
-      await new Promise((r) => setTimeout(r, 400));
-    }
 
     console.log("Checkpoint B: funding alice and bob...");
     const tx = new Transaction().add(
@@ -86,31 +110,15 @@ describe("PoolSync Phase 1: Core AMM Program", () => {
         lamports: 10 * anchor.web3.LAMPORTS_PER_SOL,
       })
     );
-    await sendAndConfirmTransaction(provider.connection, tx, [payer], { commitment: "confirmed" });
+    await sendTx(provider.connection, tx, [payer]);
     console.log("Checkpoint B done: funded alice and bob");
 
     console.log("Checkpoint C: creating mint X...");
-    tokenMintX = await createMint(
-      provider.connection,
-      payer,
-      payer.publicKey,
-      null,
-      9,
-      Keypair.generate(),
-      { commitment: "confirmed" }
-    );
+    tokenMintX = await customCreateMint(provider.connection, payer, payer.publicKey, 9);
     console.log("Checkpoint C done: tokenMintX =", tokenMintX.toBase58());
 
     console.log("Checkpoint D: creating mint Y...");
-    tokenMintY = await createMint(
-      provider.connection,
-      payer,
-      payer.publicKey,
-      null,
-      6,
-      Keypair.generate(),
-      { commitment: "confirmed" }
-    );
+    tokenMintY = await customCreateMint(provider.connection, payer, payer.publicKey, 6);
     console.log("Checkpoint D done: tokenMintY =", tokenMintY.toBase58());
 
     // Derive PDAs
@@ -152,7 +160,7 @@ describe("PoolSync Phase 1: Core AMM Program", () => {
       createMintToInstruction(tokenMintY, bobTokenY, payer.publicKey, 100_000_000_000)
     );
     console.log("Checkpoint E: setting up accounts...");
-    await sendAndConfirmTransaction(provider.connection, setupAccountsTx, [payer], { commitment: "confirmed" });
+    await sendTx(provider.connection, setupAccountsTx, [payer]);
     console.log("Checkpoint F: setup accounts done");
   });
 
@@ -191,7 +199,7 @@ describe("PoolSync Phase 1: Core AMM Program", () => {
     const createLpTx = new Transaction().add(
       createAssociatedTokenAccountInstruction(alice.publicKey, aliceLp, alice.publicKey, lpMintPda)
     );
-    await sendAndConfirmTransaction(provider.connection, createLpTx, [alice]);
+    await sendTx(provider.connection, createLpTx, [alice]);
 
     // Deposit 1,000 SOL (token X) and 100,000 USDC (token Y)
     const depositX = new BN(1_000_000_000_000); // 1,000 * 10^9

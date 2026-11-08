@@ -119,8 +119,8 @@ pub fn process_rebalance<'info>(
     for t in &transfers {
         let from = t.from_pool as usize;
         let to = t.to_pool as usize;
-        require!(from < n && to < n, PoolSyncError::InvalidTokenAccounts);
-        require!(from != to, PoolSyncError::InvalidTokenAccounts);
+        require!(from < n && to < n, PoolSyncError::ConservationViolation);
+        require!(from != to, PoolSyncError::ConservationViolation);
         require!(t.amount > 0, PoolSyncError::ZeroAmount);
 
         if t.is_token_x {

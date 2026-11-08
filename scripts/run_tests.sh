@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-source "$HOME/.cargo/env"
+source "$HOME/.cargo/env" || true
 export PATH="$HOME/.nvm/versions/node/v24.10.0/bin:$HOME/.local/share/solana/install/active_release/bin:$HOME/.avm/bin:$PATH"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,11 +18,10 @@ solana-test-validator \
 VAL_PID=$!
 trap "kill $VAL_PID 2>/dev/null || true" EXIT
 
-echo "Waiting for validator RPC to be ready and reach slot 40..."
-while true; do
-    SLOT=$(solana slot --url http://127.0.0.1:8899 2>/dev/null || echo 0)
-    if [ "$SLOT" -ge 40 ]; then
-        echo "Validator ready at slot $SLOT!"
+echo "Waiting for validator RPC to be ready..."
+for i in $(seq 1 30); do
+    if solana cluster-version --url http://127.0.0.1:8899 >/dev/null 2>&1; then
+        echo "Validator ready after $i seconds!"
         break
     fi
     sleep 1
