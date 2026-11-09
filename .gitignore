@@ -1,6 +1,9 @@
 # Build and dependency artifacts
 target/
 node_modules/
+**/node_modules/
+.next/
+**/.next/
 dist/
 build/
 .anchor/
@@ -22,6 +25,8 @@ env/
 *.json
 !package.json
 !tsconfig.json
+!dashboard/**/package.json
+!dashboard/**/tsconfig.json
 !Anchor.toml
 !programs/**/Cargo.lock
 !vendor/**/Cargo.lock
@@ -36,3 +41,4 @@ env/
 .vscode/
 .DS_Store
 Thumbs.db
+next-env.d.ts
