@@ -51,9 +51,25 @@ describe("PoolSync Phase 2: Multi-Pool Atomic Rebalance", () => {
     tx.recentBlockhash = blockhash;
     tx.feePayer = signers[0].publicKey;
     tx.sign(...signers);
-    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: "processed" });
-    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "processed");
-    return sig;
+    const rawTx = tx.serialize();
+    const sig = await connection.sendRawTransaction(rawTx, {
+      skipPreflight: false,
+      preflightCommitment: "processed",
+    });
+
+    const start = Date.now();
+    while (Date.now() - start < 30000) {
+      const res = await connection.getSignatureStatus(sig, { searchTransactionHistory: true });
+      if (res && res.value) {
+        if (res.value.err) throw new Error(`Tx failed: ${JSON.stringify(res.value.err)}`);
+        if (res.value.confirmationStatus) return sig;
+      }
+      try {
+        await connection.sendRawTransaction(rawTx, { skipPreflight: true });
+      } catch (_) {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    throw new Error(`Transaction ${sig} confirmation timed out after 30s`);
   }
 
   async function customCreateMint(

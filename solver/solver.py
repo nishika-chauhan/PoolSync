@@ -323,3 +323,150 @@ def check_k_monotonicity(result: RebalanceResult) -> Tuple[bool, str]:
         if not ok:
             all_ok = False
     return all_ok, "; ".join(details)
+
+
+def decompose_transfers_to_hops(
+    transfers_x: List[int],
+    transfers_y: List[int],
+) -> List[dict]:
+    """
+    Decompose integer token deltas (lamports / micro-tokens) into pairwise TransferHop records.
+    transfers_x[i] > 0 means pool i receives token X; < 0 means pool i sends token X.
+    """
+    hops = []
+    # Token X hops
+    senders_x = [[i, -val] for i, val in enumerate(transfers_x) if val < 0]
+    receivers_x = [[i, val] for i, val in enumerate(transfers_x) if val > 0]
+    s_idx, r_idx = 0, 0
+    while s_idx < len(senders_x) and r_idx < len(receivers_x):
+        amount = min(senders_x[s_idx][1], receivers_x[r_idx][1])
+        if amount > 0:
+            hops.append({
+                "from_pool": int(senders_x[s_idx][0]),
+                "to_pool": int(receivers_x[r_idx][0]),
+                "is_token_x": True,
+                "amount": int(amount),
+            })
+            senders_x[s_idx][1] -= amount
+            receivers_x[r_idx][1] -= amount
+        if senders_x[s_idx][1] == 0:
+            s_idx += 1
+        if receivers_x[r_idx][1] == 0:
+            r_idx += 1
+
+    # Token Y hops
+    senders_y = [[i, -val] for i, val in enumerate(transfers_y) if val < 0]
+    receivers_y = [[i, val] for i, val in enumerate(transfers_y) if val > 0]
+    s_idx, r_idx = 0, 0
+    while s_idx < len(senders_y) and r_idx < len(receivers_y):
+        amount = min(senders_y[s_idx][1], receivers_y[r_idx][1])
+        if amount > 0:
+            hops.append({
+                "from_pool": int(senders_y[s_idx][0]),
+                "to_pool": int(receivers_y[r_idx][0]),
+                "is_token_x": False,
+                "amount": int(amount),
+            })
+            senders_y[s_idx][1] -= amount
+            receivers_y[r_idx][1] -= amount
+        if senders_y[s_idx][1] == 0:
+            s_idx += 1
+        if receivers_y[r_idx][1] == 0:
+            r_idx += 1
+
+    return hops
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+    import sys
+
+    parser = argparse.ArgumentParser(description="PoolSync Convex Reference Solver CLI")
+    parser.add_argument("--json-pools", type=str, help="JSON list of pools")
+    parser.add_argument("--pools-file", type=str, help="Path to JSON file containing list of pools")
+    parser.add_argument("--raw-units", action="store_true", help="Inputs are in raw integer units (lamports/micro-units)")
+    parser.add_argument("--decimals-x", type=int, default=9, help="Decimals of token X (default: 9)")
+    parser.add_argument("--decimals-y", type=int, default=6, help="Decimals of token Y (default: 6)")
+    parser.add_argument("--demo-vector-4", action="store_true", help="Run with SPEC Test Vector 4")
+
+    args = parser.parse_args()
+
+    if args.demo_vector_4:
+        pools = [
+            Pool(x=1000.0, y=100000.0, weight=1.0),
+            Pool(x=1000.0, y=105000.0, weight=1.0),
+        ]
+        result = solve(pools)
+        print(f"Status: {result.status}")
+        print(f"Common price: {result.pools_after[0].spot_price:.4f}")
+        print(f"Arbitrage free: {result.is_arbitrage_free}")
+        print(f"Pool 0 after: x={result.pools_after[0].x:.6f}, y={result.pools_after[0].y:.6f}, k={result.pools_after[0].k:.2f}")
+        print(f"Pool 1 after: x={result.pools_after[1].x:.6f}, y={result.pools_after[1].y:.6f}, k={result.pools_after[1].k:.2f}")
+        print(f"Transfers X: {result.transfers_x}")
+        print(f"Transfers Y: {result.transfers_y}")
+        sys.exit(0)
+
+    if args.pools_file:
+        with open(args.pools_file, "r", encoding="utf-8") as pf:
+            args.json_pools = pf.read()
+
+    if args.json_pools:
+        raw_pools = json.loads(args.json_pools)
+        factor_x = 10**args.decimals_x if args.raw_units else 1.0
+        factor_y = 10**args.decimals_y if args.raw_units else 1.0
+
+        pools = [
+            Pool(
+                x=float(p["x"]) / factor_x,
+                y=float(p["y"]) / factor_y,
+                weight=float(p.get("weight", 1.0)),
+            )
+            for p in raw_pools
+        ]
+        result = solve(pools)
+
+        # Compute integer transfers in raw units
+        raw_transfers_x = [int(round(tx * factor_x)) for tx in result.transfers_x]
+        raw_transfers_y = [int(round(ty * factor_y)) for ty in result.transfers_y]
+
+        # Enforce exact zero sum integer conservation
+        if sum(raw_transfers_x) != 0:
+            raw_transfers_x[0] -= sum(raw_transfers_x)
+        if sum(raw_transfers_y) != 0:
+            raw_transfers_y[0] -= sum(raw_transfers_y)
+
+        # Enforce strict integer k-monotonicity per pool (rounding in pool's favor per SPEC Check 4)
+        for i in range(len(raw_pools)):
+            rx = int(raw_pools[i]["x"])
+            ry = int(raw_pools[i]["y"])
+            old_k = rx * ry
+            new_x = rx + raw_transfers_x[i]
+            new_y = ry + raw_transfers_y[i]
+            if new_x * new_y < old_k:
+                if raw_transfers_x[i] > 0 and raw_transfers_y[i] < 0:
+                    needed_x = (old_k + new_y - 1) // new_y
+                    diff = needed_x - new_x
+                    raw_transfers_x[i] += diff
+                    other = (i + 1) % len(raw_pools)
+                    raw_transfers_x[other] -= diff
+                elif raw_transfers_y[i] > 0 and raw_transfers_x[i] < 0:
+                    needed_y = (old_k + new_x - 1) // new_x
+                    diff = needed_y - new_y
+                    raw_transfers_y[i] += diff
+                    other = (i + 1) % len(raw_pools)
+                    raw_transfers_y[other] -= diff
+
+        hops = decompose_transfers_to_hops(raw_transfers_x, raw_transfers_y)
+
+        output = {
+            "status": result.status,
+            "is_arbitrage_free": result.is_arbitrage_free,
+            "common_price": result.pools_after[0].spot_price,
+            "pools_before": [{"x": p.x, "y": p.y, "k": p.k, "price": p.spot_price} for p in result.pools_before],
+            "pools_after": [{"x": p.x, "y": p.y, "k": p.k, "price": p.spot_price} for p in result.pools_after],
+            "raw_transfers_x": raw_transfers_x,
+            "raw_transfers_y": raw_transfers_y,
+            "transfer_hops": hops,
+        }
+        print(json.dumps(output, indent=2))
